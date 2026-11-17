@@ -10,6 +10,7 @@ import React from "react";
 import { useTranslation } from "react-i18next";
 import { LoaderCircle } from "lucide-react";
 import { OpenHandsEvent } from "#/types/agent-server/core";
+import type { OHEvent } from "#/stores/use-event-store";
 import { I18nKey } from "#/i18n/declaration";
 import { useAgentState, usePlanningAgentState } from "#/hooks/use-agent-state";
 import { AgentState } from "#/types/agent-state";
@@ -26,6 +27,8 @@ import { buildActionById } from "./event-thought-helpers";
 import { getSingleToolEvent } from "./event-message-components/event-group-summary";
 import { EventGroup } from "./event-message-components/event-group";
 import { ThoughtEventMessage } from "./event-message-components/thought-event-message";
+import { DecisionCard } from "./event-message-components/decision-card";
+import { indexDecisionClosures } from "#/utils/decision-closures";
 import { getStepKey, StepDisclosureContext } from "./step-disclosure-context";
 import { useModelStore } from "#/stores/model-store";
 import { ModelMessages } from "#/components/features/chat/model-messages";
@@ -43,6 +46,8 @@ interface MessagesProps {
   hasOlderEvents?: boolean;
   pendingMessages?: React.ReactNode;
   pendingSessionId?: string;
+  /** A shared, read-only view: nothing in it can act on the conversation. */
+  readOnly?: boolean;
 }
 
 const getLastEventId = (events: OpenHandsEvent[]) => events.at(-1)?.id;
@@ -55,6 +60,7 @@ export const Messages: React.FC<MessagesProps> = React.memo(
     hasOlderEvents = false,
     pendingMessages,
     pendingSessionId,
+    readOnly = false,
   }) => {
     const { conversationId } = useOptionalConversationId();
     const { key: sessionKey, sessions } = useSessionActivities(conversationId);
@@ -159,6 +165,10 @@ export const Messages: React.FC<MessagesProps> = React.memo(
       () => new Map(messages.map((event, index) => [event, index])),
       [messages],
     );
+    const decisionClosures = React.useMemo(
+      () => indexDecisionClosures(allEvents),
+      [allEvents],
+    );
     const groupedReasoningIds = new Set(
       renderedItems.flatMap((item) =>
         item.kind === "group"
@@ -174,12 +184,33 @@ export const Messages: React.FC<MessagesProps> = React.memo(
       );
 
     const renderEventMessage = (
-      event: OpenHandsEvent,
+      event: OHEvent,
       index: number,
       suppressThought: boolean,
       detailsOnly = false,
     ) => {
       const stepKey = getStepKey(event);
+      const action = isObservationEvent(event)
+        ? actionById.get(event.action_id)
+        : undefined;
+      if (
+        isObservationEvent(event) &&
+        event.observation.kind === "AskUserObservation" &&
+        !event.observation.is_error &&
+        (action?.action.kind === "AskUserAction" ||
+          action?.action.kind === "AskUserForConversationAction")
+      ) {
+        return (
+          <DecisionCard
+            key={stepKey}
+            askId={action.id}
+            action={action.action}
+            planner={!!event.isFromPlanningAgent}
+            closure={decisionClosures.get(event.id)}
+            readOnly={readOnly}
+          />
+        );
+      }
       return (
         <StepDisclosureContext.Provider
           key={stepKey}

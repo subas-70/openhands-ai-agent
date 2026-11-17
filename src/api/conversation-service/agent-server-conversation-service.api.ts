@@ -393,6 +393,7 @@ function requireDirectConversationInfo(item: unknown): DirectConversationInfo {
     agent: normalizeAgent(item.agent),
     workspace: normalizeWorkspace(item.workspace),
     tags: normalizeTags(item.tags),
+    parent_conversation_id: stringOrNull(item.parent_conversation_id),
     launched_agent_profile: normalizeLaunchedAgentProfile(
       item.launched_agent_profile,
     ),
@@ -547,6 +548,23 @@ export interface CreateConversationOptions {
 }
 
 class AgentServerConversationService {
+  static async answerAskUser(
+    conversationId: string,
+    askId: string,
+    answer: { optionIndex?: number; text?: string },
+    runtime?: ConversationRuntimeContext | null,
+  ) {
+    if (
+      getActiveBackend().backend.kind === "cloud" &&
+      (!runtime?.conversationUrl || !runtime.sessionApiKey)
+    ) {
+      throw new Error("Conversation sandbox is still starting.");
+    }
+    return new ConversationClient(
+      getAgentServerClientOptions(runtime ?? {}),
+    ).answerAskUser(conversationId, askId, answer);
+  }
+
   static async sendMessage(
     conversationId: string,
     message: SendMessageRequest,
