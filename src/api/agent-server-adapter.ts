@@ -598,6 +598,89 @@ export const AUTOMATION_NAME_TAG_KEY = "automationname";
 export const AUTOMATION_RUN_ID_TAG_KEY = "automationrunid";
 
 /**
+ * Escape a string for safe inclusion inside a single-quoted POSIX shell
+ * literal (hook commands run via `sh -c` in the sandbox). Replaces every
+ * `'` with `'\\''`: close the quote, emit a backslash-escaped quote, then
+ * reopen — the standard POSIX idiom.
+ */
+function shellEscapeSingleQuoted(value: string): string {
+  return value.replace(/'/g, "'\\''");
+}
+
+/**
+ * Build the session_start {@link HookConfig} entry that stamps the sandbox's
+ * global git identity from the user-configured name/email, so every agent
+ * `git commit` in the conversation uses Settings → Application values even
+ * when the host has no `~/.gitconfig` or a different one (#17899).
+ *
+ * Returns `undefined` when either field is missing or blank, so callers
+ * omit the hook entirely rather than injecting a no-op command.
+ */
+export function buildGitIdentitySessionStartHook(
+  gitUserName?: string | null,
+  gitUserEmail?: string | null,
+): NonNullable<HookConfig["session_start"]>[number] | undefined {
+  const name = gitUserName?.trim();
+  const email = gitUserEmail?.trim();
+  if (!name || !email) return undefined;
+
+  // Skip injecting a git-identity hook when the configured values match the
+  // Canvas defaults — the sandbox / SDK already ships those same defaults,
+  // so a redundant `git config --global` at conversation start would be a
+  // no-op and would also break callers that rely on hook_config staying
+  // undefined when the user has not explicitly overridden the identity
+  // (see the Ubuntu test-and-build failure in PR #19752).
+  if (
+    name === DEFAULT_SETTINGS.git_user_name &&
+    email === DEFAULT_SETTINGS.git_user_email
+  ) {
+    return undefined;
+  }
+
+  const command = [
+    "git config --global user.name",
+    `'${shellEscapeSingleQuoted(name)}'`,
+    "&&",
+    "git config --global user.email",
+    `'${shellEscapeSingleQuoted(email)}'`,
+  ].join(" ");
+
+  return {
+    matcher: "*",
+    hooks: [{ type: HookType.COMMAND, command }],
+  };
+}
+
+/**
+ * Merge the Settings-configured git identity into a {@link HookConfig}'s
+ * `session_start` array (preserving any workspace / conversation hooks that
+ * are already there). When no identity is configured, the original config
+ * is returned unchanged.
+ */
+export function mergeGitIdentityIntoHookConfig(
+  hookConfig: HookConfig | null | undefined,
+  gitUserName?: string | null,
+  gitUserEmail?: string | null,
+): HookConfig | undefined {
+  const gitHook = buildGitIdentitySessionStartHook(gitUserName, gitUserEmail);
+  if (!gitHook) return hookConfig ?? undefined;
+
+  const existingSessionStart = hookConfig?.session_start ?? [];
+  const mergedSessionStart = [...existingSessionStart, gitHook];
+
+  const merged: HookConfig = {
+    pre_tool_use: hookConfig?.pre_tool_use ?? [],
+    post_tool_use: hookConfig?.post_tool_use ?? [],
+    user_prompt_submit: hookConfig?.user_prompt_submit ?? [],
+    session_start: mergedSessionStart,
+    session_end: hookConfig?.session_end ?? [],
+    stop: hookConfig?.stop ?? [],
+  };
+
+  return merged;
+}
+
+/**
  * Tag keys stamped on conversations created by automation runs (see the SDK's
  * `RemoteWorkspace.default_conversation_tags`). The presence of any of these
  * marks a conversation as automation-born.
@@ -1286,10 +1369,17 @@ export function buildStartConversationRequest(
     payload.plugins = conversationSettings.plugins;
   }
 
-  if (conversationSettings.hook_config) {
-    payload.hook_config = conversationSettings.hook_config;
-  } else if (options.workspaceHookConfig) {
-    payload.hook_config = options.workspaceHookConfig;
+  const baseHookConfig =
+    (conversationSettings.hook_config as unknown as HookConfig | undefined) ??
+    options.workspaceHookConfig ??
+    null;
+  const mergedHookConfig = mergeGitIdentityIntoHookConfig(
+    baseHookConfig,
+    options.settings.git_user_name,
+    options.settings.git_user_email,
+  );
+  if (mergedHookConfig) {
+    payload.hook_config = mergedHookConfig;
   }
 
   const toolModuleQualnames = {
@@ -1328,6 +1418,15 @@ export function buildStartPlanningConversationRequest(options: {
   skillEnablement?: SkillEnablement;
   /** Mirrors the main conversation's workspace selection — see buildConfiguredConversationSettings. */
   executionRuntime?: AgentServerInfo["execution_runtime"];
+  /**
+   * Optional pre-existing workspace or conversation-scoped hooks to merge
+   * the git identity into (same source as {@link StartConversationOptions.workspaceHookConfig}).
+   */
+  baseHookConfig?: HookConfig | null;
+  /** App-level git identity injected via a `session_start` hook (#17899). */
+  gitUserName?: string | null;
+  /** App-level git identity injected via a `session_start` hook (#17899). */
+  gitUserEmail?: string | null;
 }): RawAgentStartConversationPayload {
   const agentSettings = toRecord(options.encryptedAgentSettings);
   const llm = buildNormalizedLlmSettings(agentSettings.llm);
@@ -1428,6 +1527,15 @@ export function buildStartPlanningConversationRequest(options: {
 
   if (options.secretsEncrypted) {
     payload.secrets_encrypted = true;
+  }
+
+  const mergedHookConfig = mergeGitIdentityIntoHookConfig(
+    options.baseHookConfig,
+    options.gitUserName,
+    options.gitUserEmail,
+  );
+  if (mergedHookConfig) {
+    payload.hook_config = mergedHookConfig;
   }
 
   const secrets = buildCustomSecrets(options.customSecrets);
@@ -1599,6 +1707,8 @@ export async function buildStartPlanningConversationRequestWithEncryptedSettings
     customSecrets,
     maxIterations,
     skillEnablement: profileSkillSelection ?? settingsResult.skillEnablement,
+    gitUserName: settingsResult.gitUserName,
+    gitUserEmail: settingsResult.gitUserEmail,
   });
 }
 
